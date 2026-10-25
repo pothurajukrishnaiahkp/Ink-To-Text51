@@ -1,0 +1,354 @@
+name: Build APK with Fixed 0 vs o and Profile Photo
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create project files and add profile photo
+        run: |
+          mkdir -p app/src/main/res/drawable
+          # మీ ఫోటోను drawable లోకి సేవ్ చేయడానికి (Base64 రూపంలో లేదా కాపీ చేయడం ద్వారా)
+          # ఇక్కడ కేవలం ఉదాహరణకు base64 డీకోడింగ్ స్టెప్ లేదా రిసోర్స్ ఫైల్ సృష్టి ఉంటుంది.
+          
+          cat > settings.gradle.kts << 'EOF_INK'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "InkToText"
+          include(":app")
+          EOF_INK
+
+          cat > build.gradle.kts << 'EOF_INK'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_INK
+
+          cat > gradle.properties << 'EOF_INK'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_INK
+
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml << 'EOF_INK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:label="KRISH Math"
+                  android:icon="@drawable/profile"
+                  android:roundIcon="@drawable/profile"
+                  android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_INK
+
+          mkdir -p app/src/main/java/com/example/inktotext
+          cat > app/src/main/java/com/example/inktotext/MainActivity.kt << 'EOF_INK'
+          package com.example.inktotext
+
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.provider.MediaStore
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.HorizontalScrollView
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AlertDialog
+          import androidx.appcompat.app.AppCompatActivity
+          import com.google.mlkit.common.model.DownloadConditions
+          import com.google.mlkit.common.model.RemoteModelManager
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognition
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognitionModel
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognitionModelIdentifier
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognizer
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognizerOptions
+          import com.google.mlkit.vision.digitalink.RecognitionContext
+          import com.google.mlkit.vision.digitalink.WritingArea
+          import com.google.mlkit.vision.digitalink.Ink
+
+          class DrawingView(context: Context) : View(context) {
+              class TextItem(
+                  val text: String, val copy: String, val cx: Float, val baseline: Float,
+                  val size: Float, val color: Int, val sup: Boolean
+              ) { var group = 0 }
+
+              class LineItem(
+                  val x1: Float, val y1: Float, val x2: Float, val y2: Float, val color: Int
+              ) { var group = 0 }
+
+              class Group(val copy: String, val y: Float, val x0: Float, val size: Float, val count: Int)
+              class PStroke(val stroke: Ink.Stroke, val path: Path, val color: Int)
+
+              var penColor = Color.BLACK
+              var eraser = false
+              private val eraseRadius = 40f
+              private val palmSize = 60f * context.resources.displayMetrics.density
+              private var erasing = false
+              private var lastStylus = 0L
+              private var eraseX = 0f
+              private var eraseY = 0f
+              private var eraseShowR = 0f
+              private val circlePaint = Paint().apply {
+                  style = Paint.Style.STROKE; strokeWidth = 4f; isAntiAlias = true; color = 0xFF9E9E9E.toInt()
+              }
+
+              private val inkPaint = Paint().apply {
+                  style = Paint.Style.STROKE; strokeWidth = 8f; isAntiAlias = true
+                  strokeJoin = Paint.Join.ROUND; strokeCap = Paint.Cap.ROUND
+              }
+              private val linePaint = Paint().apply {
+                  style = Paint.Style.STROKE; strokeWidth = 6f; isAntiAlias = true
+                  strokeCap = Paint.Cap.ROUND
+              }
+
+              private val clearTypeface: Typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+
+              private val textPaint = Paint().apply {
+                  isAntiAlias = true; typeface = clearTypeface; textAlign = Paint.Align.CENTER
+              }
+
+              private var curPath = Path()
+              private var curColor = Color.BLACK
+              private var strokeBuilder: Ink.Stroke.Builder? = null
+
+              val pending = mutableListOf<PStroke>()
+              private val items = mutableListOf<TextItem>()
+              private val lineItems = mutableListOf<LineItem>()
+              private val groups = HashMap<Int, Group>()
+
+              var onStrokeFinished: (() -> Unit)? = null
+              var onStrokeStarted: (() -> Unit)? = null
+
+              init { setBackgroundColor(Color.WHITE) }
+
+              override fun onDraw(canvas: Canvas) {
+                  for (p in pending) { inkPaint.color = p.color; canvas.drawPath(p.path, inkPaint) }
+                  inkPaint.color = curColor
+                  canvas.drawPath(curPath, inkPaint)
+                  for (ln in lineItems) {
+                      linePaint.color = ln.color
+                      canvas.drawLine(ln.x1, ln.y1, ln.x2, ln.y2, linePaint)
+                  }
+                  for (ti in items) {
+                      textPaint.color = ti.color
+                      textPaint.textSize = ti.size
+                      canvas.drawText(ti.text, ti.cx, ti.baseline, textPaint)
+                      // 0 మరియు o మధ్య తేడా స్పష్టంగా చూపడానికి 0 పై స్లాష్ గీయడం
+                      if (ti.text == "0") {
+                          val slashPaint = Paint().apply {
+                              color = ti.color; strokeWidth = 3f; style = Paint.Style.STROKE; isAntiAlias = true
+                          }
+                          canvas.drawLine(ti.cx - ti.size * 0.2f, ti.baseline - ti.size * 0.5f,
+                                          ti.cx + ti.size * 0.2f, ti.baseline - ti.size * 0.1f, slashPaint)
+                      }
+                  }
+                  if (erasing) canvas.drawCircle(eraseX, eraseY, eraseShowR, circlePaint)
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  val x = e.x; val y = e.y; val t = SystemClock.uptimeMillis()
+                  val now = SystemClock.uptimeMillis()
+                  if (e.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS) lastStylus = now
+                  val stylusNear = now - lastStylus < 1000
+                  var bigIdx = -1
+                  var bigR = eraseRadius
+                  for (i in 0 until e.pointerCount) {
+                      val tt = e.getToolType(i)
+                      val big = tt == MotionEvent.TOOL_TYPE_FINGER && !stylusNear &&
+                              e.getTouchMajor(i) >= palmSize
+                      if (tt == MotionEvent.TOOL_TYPE_ERASER || big) {
+                          bigIdx = i
+                          bigR = maxOf(eraseRadius, e.getTouchMajor(i) / 2f)
+                          break
+                      }
+                  }
+                  val twoFingers = e.pointerCount >= 2 && !stylusNear
+                  if (eraser || bigIdx >= 0 || twoFingers || erasing) {
+                      val ma = e.actionMasked
+                      if (ma == MotionEvent.ACTION_UP || ma == MotionEvent.ACTION_CANCEL) {
+                          if (erasing) { erasing = false; onStrokeFinished?.invoke() }
+                          invalidate()
+                          return true
+                      }
+                      if (!erasing) {
+                          erasing = true
+                          strokeBuilder = null
+                          curPath = Path()
+                          onStrokeStarted?.invoke()
+                      }
+                      val r = if (bigIdx >= 0) bigR else eraseRadius
+                      for (i in 0 until e.pointerCount) erase(e.getX(i), e.getY(i), r)
+                      eraseX = e.getX(0); eraseY = e.getY(0); eraseShowR = r
+                      invalidate()
+                      return true
+                  }
+
+                  when (e.action) {
+                      MotionEvent.ACTION_DOWN -> {
+                          onStrokeStarted?.invoke()
+                          curColor = penColor
+                          curPath = Path().also { it.moveTo(x, y) }
+                          strokeBuilder = Ink.Stroke.builder().also {
+                              it.addPoint(Ink.Point.create(x, y, t))
+                          }
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          if (strokeBuilder == null) return true
+                          curPath.lineTo(x, y)
+                          strokeBuilder?.addPoint(Ink.Point.create(x, y, t))
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          if (strokeBuilder == null) return true
+                          curPath.lineTo(x, y)
+                          strokeBuilder?.addPoint(Ink.Point.create(x, y, t))
+                          strokeBuilder?.let { pending.add(PStroke(it.build(), curPath, curColor)) }
+                          curPath = Path()
+                          strokeBuilder = null
+                          onStrokeFinished?.invoke()
+                      }
+                      else -> return false
+                  }
+                  invalidate()
+                  return true
+              }
+
+              private fun distToSegment(px: Float, py: Float, ln: LineItem): Float {
+                  val dx = ln.x2 - ln.x1; val dy = ln.y2 - ln.y1
+                  val len2 = dx * dx + dy * dy
+                  var t = if (len2 == 0f) 0f else ((px - ln.x1) * dx + (py - ln.y1) * dy) / len2
+                  t = t.coerceIn(0f, 1f)
+                  val cx = ln.x1 + t * dx; val cy = ln.y1 + t * dy
+                  return Math.hypot((px - cx).toDouble(), (py - cy).toDouble()).toFloat()
+              }
+
+              private fun erase(x: Float, y: Float, rad: Float) {
+                  pending.removeAll { p ->
+                      p.stroke.points.any {
+                          Math.hypot((it.x - x).toDouble(), (it.y - y).toDouble()) < rad
+                      }
+                  }
+                  lineItems.removeAll { ln -> distToSegment(x, y, ln) < rad }
+                  items.removeAll { item ->
+                      textPaint.textSize = item.size
+                      val w = textPaint.measureText(item.text) / 2 + rad
+                      x in (item.cx - w)..(item.cx + w) &&
+                              y in (item.baseline - item.size - rad / 2)..(item.baseline + item.size * 0.3f + rad / 2)
+                  }
+              }
+
+              fun commit(
+                  done: List<PStroke>, newItems: List<TextItem>,
+                  newLines: List<LineItem>, newGroups: Map<Int, Group>
+              ) {
+                  pending.removeAll { p -> done.any { it === p } }
+                  items.addAll(newItems)
+                  lineItems.addAll(newLines)
+                  groups.putAll(newGroups)
+                  invalidate()
+              }
+
+              fun clearAll() {
+                  pending.clear(); items.clear(); lineItems.clear(); groups.clear()
+                  curPath = Path(); strokeBuilder = null
+                  invalidate()
+              }
+
+              fun toBitmap(): Bitmap {
+                  val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                  draw(Canvas(bmp))
+                  return bmp
+              }
+
+              fun plainText(): String {
+                  class E(val y: Float, val x0: Float, val size: Float, val text: String)
+                  val entries = mutableListOf<E>()
+                  for ((g, list) in items.groupBy { it.group }) {
+                      val info = groups[g]
+                      if (info != null && info.count == list.size) {
+                          entries.add(E(info.y, info.x0, info.size, info.copy))
+                      } else {
+                          val normals = list.filter { !it.sup }
+                          val ys = (if (normals.isEmpty()) list else normals).map { it.baseline }
+                          entries.add(E(ys.average().toFloat(), list.minOf { it.cx }, list[0].size,
+                              list.sortedBy { it.cx }.joinToString("") { it.copy }))
+                      }
+                  }
+                  val lines = mutableListOf<MutableList<E>>()
+                  for (e in entries.sortedBy { it.y }) {
+                      val ln = lines.firstOrNull { Math.abs(it[0].y - e.y) < e.size * 0.6f }
+                      if (ln != null) ln.add(e) else lines.add(mutableListOf(e))
+                  }
+                  return lines.joinToString("\n") { ln ->
+                      ln.sortedBy { it.x0 }.joinToString("") { it.text }
+                  }
+              }
+          }
+
+          class MainActivity : AppCompatActivity() {
+              private lateinit var recognizer: DigitalInkRecognizer
+              private lateinit var drawing: DrawingView
+              private val handler = Handler(Looper.getMainLooper())
+              private var modelReady = false
+              private var textScale = 1.0f
+              private var textMode = 0
+              private var activeMode = 0
+              private var baseSize = 0f
+              private var nextGroup = 1
+              private val measurePaint = Paint().apply { 
+                  typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD) 
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  drawing = DrawingView(this)
+
+                  fun tool(label: String) = Button(this).apply { text = label; isAllCaps = false }
+                  val modeBtn = tool("✏️ Pen")
+                  val mathBtn = tool("Abc")
+                  val minusBtn = tool("A−")
+                  val plusBtn = tool("A+")
+                  val scaleLabel = TextView(this).apply {
+                      text = "100%"; gravity = Gravity.CENTER; setPadding(dp(6), 0,
